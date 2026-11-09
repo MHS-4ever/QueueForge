@@ -1,8 +1,11 @@
 import io
 import json
 
+import pytest
+
+from queueforge.faults import InjectedFault
 from queueforge.jobs import Claim
-from queueforge.service import process_object
+from queueforge.service import ReportConflict, process_object
 
 
 class AwsError(Exception):
@@ -74,6 +77,35 @@ def test_safe_retry_after_identical_result_creation():
     assert retry_id == job_id
     assert status == "COMPLETED"
     assert second_jobs.finalized[0][1] == "COMPLETED"
+
+
+def test_crash_after_report_then_safe_retry():
+    source = b'[{"record_id":"r1","customer_id":"c1","amount":1}]'
+    s3 = FakeS3(source)
+    with pytest.raises(InjectedFault):
+        process_object(
+            s3,
+            FakeJobs(),
+            "bucket",
+            "incoming/a.json",
+            "v1",
+            fault="after_report",
+        )
+    retry_jobs = FakeJobs()
+    _, status = process_object(s3, retry_jobs, "bucket", "incoming/a.json", "v1")
+    assert status == "COMPLETED"
+    assert retry_jobs.finalized[0][1] == "COMPLETED"
+
+
+def test_inconsistent_existing_report_is_never_overwritten():
+    s3 = FakeS3(b'[{"record_id":"r1","customer_id":"c1","amount":1}]')
+    s3.reports["results/placeholder"] = b"unused"
+    first_jobs = FakeJobs()
+    job_id, _ = process_object(s3, first_jobs, "bucket", "incoming/a.json", "v1")
+    s3.reports[f"results/{job_id}.json"] = b'{"different":true}'
+    with pytest.raises(ReportConflict):
+        process_object(s3, FakeJobs(), "bucket", "incoming/a.json", "v1")
+    assert s3.reports[f"results/{job_id}.json"] == b'{"different":true}'
 
 
 def test_terminal_duplicate_skips_s3_read_and_write():

@@ -25,3 +25,7 @@ output "log_group_name" {
 output "jobs_table_name" {
   value = aws_dynamodb_table.jobs.name
 }
+
+output "dlq_alarm_name" {
+  value = aws_cloudwatch_metric_alarm.dlq_visible.alarm_name
+}

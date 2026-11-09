@@ -8,8 +8,9 @@ import os
 from typing import Any
 from urllib.parse import unquote_plus
 
-from .jobs import JobStore
-from .service import process_object
+from .faults import InjectedFault, fault_point
+from .jobs import JobStore, OwnershipLost, WorkBusy, make_job_id
+from .service import ReportConflict, process_object
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -32,10 +33,33 @@ def _dependencies() -> tuple[Any, JobStore]:
 
 
 def _process_object_record(
-    bucket: str, key: str, version_id: str, size: int | None
+    bucket: str,
+    key: str,
+    version_id: str,
+    size: int | None,
+    fault: str | None,
 ) -> tuple[str, str]:
     s3, jobs = _dependencies()
-    return process_object(s3, jobs, bucket, key, version_id, size)
+    return process_object(s3, jobs, bucket, key, version_id, size, fault)
+
+
+class RecordFailure(RuntimeError):
+    def __init__(self, job_id: str, category: str, cause: Exception):
+        super().__init__(str(cause))
+        self.job_id = job_id
+        self.category = category
+
+
+def _failure_category(exc: Exception) -> str:
+    if isinstance(exc, WorkBusy):
+        return "active_lease"
+    if isinstance(exc, InjectedFault):
+        return "injected_test_fault"
+    if isinstance(exc, OwnershipLost):
+        return "ownership_lost"
+    if isinstance(exc, ReportConflict):
+        return "result_conflict"
+    return "retryable_processing_failure"
 
 
 def _process_message(message: dict[str, Any]) -> None:
@@ -50,6 +74,8 @@ def _process_message(message: dict[str, Any]) -> None:
     records = notification.get("Records")
     if not isinstance(records, list) or not records:
         raise ValueError("S3 notification requires a non-empty Records list")
+    receive_count = int(message.get("attributes", {}).get("ApproximateReceiveCount", "1"))
+    faults_enabled = os.environ.get("FAULT_INJECTION_ENABLED", "false").lower() == "true"
     for record in records:
         if record["eventSource"] != "aws:s3":
             raise ValueError("Expected an S3 event")
@@ -65,6 +91,7 @@ def _process_message(message: dict[str, Any]) -> None:
             raise ValueError("Expected an S3 bucket name and object key")
         key = unquote_plus(obj["key"])
         version_id = obj.get("versionId")
+        job_id = make_job_id(bucket, key, version_id) if version_id else "unknown"
         _log(
             "s3_object_created",
             message_id=message_id,
@@ -75,7 +102,20 @@ def _process_message(message: dict[str, Any]) -> None:
             version_id=version_id,
             sequencer=obj.get("sequencer"),
         )
-        job_id, status = _process_object_record(bucket, key, version_id, obj.get("size"))
+        fault = fault_point(faults_enabled, key, receive_count)
+        if fault:
+            _log(
+                "fault_injection_selected",
+                message_id=message_id,
+                job_id=job_id,
+                failure_category="injected_test_fault",
+                fault_point=fault,
+                receive_count=receive_count,
+            )
+        try:
+            job_id, status = _process_object_record(bucket, key, version_id, obj.get("size"), fault)
+        except Exception as exc:
+            raise RecordFailure(job_id, _failure_category(exc), exc) from exc
         _log("job_terminal", message_id=message_id, job_id=job_id, status=status)
 
 
@@ -87,6 +127,12 @@ def lambda_handler(event: dict[str, Any], context: object) -> dict[str, list[dic
         try:
             _process_message(message)
         except Exception as exc:
-            _log("message_failed", message_id=message_id, error_type=type(exc).__name__)
+            _log(
+                "message_failed",
+                message_id=message_id,
+                job_id=getattr(exc, "job_id", None),
+                failure_category=getattr(exc, "category", "malformed_event"),
+                error_type=type(exc.__cause__ or exc).__name__,
+            )
             failures.append({"itemIdentifier": message_id})
     return {"batchItemFailures": failures}

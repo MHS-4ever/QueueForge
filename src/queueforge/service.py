@@ -6,6 +6,7 @@ import json
 from decimal import Decimal
 from typing import Any
 
+from .faults import InjectedFault
 from .jobs import JobStore, make_job_id
 from .processing import MAX_FILE_BYTES, InputRejected, ProcessingResult, process_file
 
@@ -78,6 +79,7 @@ def process_object(
     key: str,
     version_id: str,
     notification_size: int | None = None,
+    fault: str | None = None,
 ) -> tuple[str, str]:
     """Process one versioned object, returning (job_id, terminal status)."""
     if not version_id:
@@ -88,6 +90,8 @@ def process_object(
     claim = jobs.claim(job_id)
     if not claim.acquired:
         return job_id, str(claim.terminal_status)
+    if fault == "before_processing":
+        raise InjectedFault(f"injected failure before processing for {job_id}")
 
     result: ProcessingResult | None = None
     rejection: str | None = None
@@ -103,6 +107,8 @@ def process_object(
     report, status, counts = _report_bytes(job_id, source, result, rejection)
     report_key = f"results/{job_id}.json"
     _write_report(s3, bucket, report_key, report)
+    if fault == "after_report":
+        raise InjectedFault(f"injected failure after report for {job_id}")
     jobs.finalize(
         claim,
         status,

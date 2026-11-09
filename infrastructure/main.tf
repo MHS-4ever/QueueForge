@@ -97,6 +97,23 @@ resource "aws_cloudwatch_log_group" "processor" {
   retention_in_days = 7
 }
 
+resource "aws_cloudwatch_metric_alarm" "dlq_visible" {
+  alarm_name          = "${local.name}-dlq-visible"
+  alarm_description   = "QueueForge dead-letter queue contains one or more visible messages."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    QueueName = aws_sqs_queue.dead_letter.name
+  }
+}
+
 resource "aws_dynamodb_table" "jobs" {
   name         = "${local.name}-jobs"
   billing_mode = "PAY_PER_REQUEST"
@@ -105,6 +122,31 @@ resource "aws_dynamodb_table" "jobs" {
   attribute {
     name = "job_id"
     type = "S"
+  }
+
+  attribute {
+    name = "status"
+    type = "S"
+  }
+
+  attribute {
+    name = "lease_expires_at"
+    type = "N"
+  }
+
+  global_secondary_index {
+    name            = "status-lease-index"
+    projection_type = "ALL"
+
+    key_schema {
+      attribute_name = "status"
+      key_type       = "HASH"
+    }
+
+    key_schema {
+      attribute_name = "lease_expires_at"
+      key_type       = "RANGE"
+    }
   }
 }
 
@@ -167,6 +209,10 @@ data "archive_file" "processor" {
     filename = "queueforge/__init__.py"
   }
   source {
+    content  = file("${path.module}/../src/queueforge/faults.py")
+    filename = "queueforge/faults.py"
+  }
+  source {
     content  = file("${path.module}/../src/queueforge/handler.py")
     filename = "queueforge/handler.py"
   }
@@ -195,8 +241,9 @@ resource "aws_lambda_function" "processor" {
   memory_size      = 256
   environment {
     variables = {
-      JOB_TABLE_NAME = aws_dynamodb_table.jobs.name
-      LEASE_SECONDS  = "120"
+      JOB_TABLE_NAME          = aws_dynamodb_table.jobs.name
+      LEASE_SECONDS           = "120"
+      FAULT_INJECTION_ENABLED = tostring(var.enable_fault_injection)
     }
   }
   depends_on = [aws_iam_role_policy.processor, aws_cloudwatch_log_group.processor]

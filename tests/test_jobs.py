@@ -85,6 +85,8 @@ def test_expired_lease_can_be_reclaimed():
     now[0] = 110
     second = store.claim("job")
     assert first.owner_token != second.owner_token
+    with pytest.raises(OwnershipLost):
+        store.finalize(first, "COMPLETED", {})
 
 
 def test_terminal_state_is_protected_and_duplicate_returns_status():

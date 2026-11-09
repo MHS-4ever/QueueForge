@@ -120,7 +120,7 @@ def test_active_duplicate_is_returned_as_batch_failure(monkeypatch):
 
 
 def test_processing_failure_does_not_fail_other_sqs_messages(monkeypatch):
-    def process(bucket, key, version_id, size):
+    def process(bucket, key, version_id, size, fault):
         if "bad" in key:
             raise RuntimeError("temporary failure")
         return "job-id", "COMPLETED"
@@ -132,4 +132,69 @@ def test_processing_failure_does_not_fail_other_sqs_messages(monkeypatch):
     ]
     assert lambda_handler({"Records": records}, None) == {
         "batchItemFailures": [{"itemIdentifier": "bad"}]
+    }
+
+
+def test_two_failures_in_five_message_batch(monkeypatch):
+    def process(bucket, key, version_id, size, fault):
+        if "bad" in key:
+            raise RuntimeError("retry")
+        return "job-id", "COMPLETED"
+
+    monkeypatch.setattr(handler, "_process_object_record", process)
+    records = [
+        message("one", notification("incoming/good-1.csv")),
+        message("two", notification("incoming/bad-1.csv")),
+        message("three", notification("incoming/good-2.csv")),
+        message("four", notification("incoming/bad-2.csv")),
+        message("five", notification("incoming/good-3.csv")),
+    ]
+    assert lambda_handler({"Records": records}, None) == {
+        "batchItemFailures": [
+            {"itemIdentifier": "two"},
+            {"itemIdentifier": "four"},
+        ]
+    }
+
+
+def test_fault_selection_uses_receive_count(monkeypatch):
+    selected = []
+
+    def process(bucket, key, version_id, size, fault):
+        selected.append(fault)
+        if fault:
+            raise RuntimeError("injected")
+        return "job-id", "COMPLETED"
+
+    monkeypatch.setattr(handler, "_process_object_record", process)
+    monkeypatch.setenv("FAULT_INJECTION_ENABLED", "true")
+    body = notification("incoming/__queueforge_faults__/first/a.csv")
+    first = message("first", body)
+    first["attributes"] = {"ApproximateReceiveCount": "1"}
+    second = message("second", body)
+    second["attributes"] = {"ApproximateReceiveCount": "2"}
+    assert lambda_handler({"Records": [first, second]}, None) == {
+        "batchItemFailures": [{"itemIdentifier": "first"}]
+    }
+    assert selected == ["before_processing", None]
+
+
+def test_persistent_fault_is_reported_on_every_delivery(monkeypatch):
+    def process(bucket, key, version_id, size, fault):
+        assert fault == "before_processing"
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(handler, "_process_object_record", process)
+    monkeypatch.setenv("FAULT_INJECTION_ENABLED", "true")
+    body = notification("incoming/__queueforge_faults__/persistent/a.csv")
+    records = []
+    for attempt in (1, 5):
+        record = message(f"attempt-{attempt}", body)
+        record["attributes"] = {"ApproximateReceiveCount": str(attempt)}
+        records.append(record)
+    assert lambda_handler({"Records": records}, None) == {
+        "batchItemFailures": [
+            {"itemIdentifier": "attempt-1"},
+            {"itemIdentifier": "attempt-5"},
+        ]
     }
