@@ -97,6 +97,17 @@ resource "aws_cloudwatch_log_group" "processor" {
   retention_in_days = 7
 }
 
+resource "aws_dynamodb_table" "jobs" {
+  name         = "${local.name}-jobs"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "job_id"
+
+  attribute {
+    name = "job_id"
+    type = "S"
+  }
+}
+
 resource "aws_iam_role" "processor" {
   name = "${local.name}-processor"
   assume_role_policy = jsonencode({
@@ -124,6 +135,25 @@ resource "aws_iam_role_policy" "processor" {
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.processor.arn}:*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObjectVersion"]
+        Resource = "${aws_s3_bucket.incoming.arn}/incoming/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject"]
+        Resource = "${aws_s3_bucket.incoming.arn}/results/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem"
+        ]
+        Resource = aws_dynamodb_table.jobs.arn
       }
     ]
   })
@@ -133,8 +163,24 @@ data "archive_file" "processor" {
   type        = "zip"
   output_path = "${path.module}/../build/processor.zip"
   source {
+    content  = file("${path.module}/../src/queueforge/__init__.py")
+    filename = "queueforge/__init__.py"
+  }
+  source {
     content  = file("${path.module}/../src/queueforge/handler.py")
-    filename = "handler.py"
+    filename = "queueforge/handler.py"
+  }
+  source {
+    content  = file("${path.module}/../src/queueforge/jobs.py")
+    filename = "queueforge/jobs.py"
+  }
+  source {
+    content  = file("${path.module}/../src/queueforge/processing.py")
+    filename = "queueforge/processing.py"
+  }
+  source {
+    content  = file("${path.module}/../src/queueforge/service.py")
+    filename = "queueforge/service.py"
   }
 }
 
@@ -142,12 +188,18 @@ resource "aws_lambda_function" "processor" {
   function_name    = "${local.name}-processor"
   role             = aws_iam_role.processor.arn
   runtime          = "python3.12"
-  handler          = "handler.lambda_handler"
+  handler          = "queueforge.handler.lambda_handler"
   filename         = data.archive_file.processor.output_path
   source_code_hash = data.archive_file.processor.output_base64sha256
   timeout          = 30
   memory_size      = 256
-  depends_on       = [aws_iam_role_policy.processor, aws_cloudwatch_log_group.processor]
+  environment {
+    variables = {
+      JOB_TABLE_NAME = aws_dynamodb_table.jobs.name
+      LEASE_SECONDS  = "120"
+    }
+  }
+  depends_on = [aws_iam_role_policy.processor, aws_cloudwatch_log_group.processor]
 }
 
 resource "aws_lambda_event_source_mapping" "processing" {

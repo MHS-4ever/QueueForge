@@ -3,7 +3,14 @@ import logging
 
 import pytest
 
+import queueforge.handler as handler
 from queueforge.handler import lambda_handler
+from queueforge.jobs import WorkBusy
+
+
+@pytest.fixture(autouse=True)
+def stub_processing(monkeypatch):
+    monkeypatch.setattr(handler, "_process_object_record", lambda *args: ("job-id", "COMPLETED"))
 
 
 def notification(key="incoming/a+file%2Bname.csv"):
@@ -29,7 +36,11 @@ def test_object_created_logs_decoded_metadata(caplog):
     with caplog.at_level(logging.INFO):
         result = lambda_handler({"Records": [message("ok", notification())]}, None)
     assert result == {"batchItemFailures": []}
-    entry = json.loads(caplog.records[-1].message)
+    entry = next(
+        json.loads(record.message)
+        for record in caplog.records
+        if json.loads(record.message)["event"] == "s3_object_created"
+    )
     assert entry == {
         "event": "s3_object_created",
         "message_id": "ok",
@@ -67,7 +78,10 @@ def test_multiple_nested_records(caplog):
     body = notification()
     body["Records"].extend(notification("incoming/second.json")["Records"])
     assert lambda_handler({"Records": [message("multi", body)]}, None) == {"batchItemFailures": []}
-    assert len(caplog.records) == 2
+    assert (
+        sum(json.loads(record.message)["event"] == "s3_object_created" for record in caplog.records)
+        == 2
+    )
 
 
 def test_nested_failure_retries_whole_sqs_message():
@@ -93,3 +107,29 @@ def test_empty_batch():
 def test_missing_message_id_fails_invocation():
     with pytest.raises(KeyError):
         lambda_handler({"Records": [{"body": "{}"}]}, None)
+
+
+def test_active_duplicate_is_returned_as_batch_failure(monkeypatch):
+    def busy(*args):
+        raise WorkBusy("owned")
+
+    monkeypatch.setattr(handler, "_process_object_record", busy)
+    assert lambda_handler({"Records": [message("duplicate", notification())]}, None) == {
+        "batchItemFailures": [{"itemIdentifier": "duplicate"}]
+    }
+
+
+def test_processing_failure_does_not_fail_other_sqs_messages(monkeypatch):
+    def process(bucket, key, version_id, size):
+        if "bad" in key:
+            raise RuntimeError("temporary failure")
+        return "job-id", "COMPLETED"
+
+    monkeypatch.setattr(handler, "_process_object_record", process)
+    records = [
+        message("bad", notification("incoming/bad.csv")),
+        message("good", notification("incoming/good.csv")),
+    ]
+    assert lambda_handler({"Records": records}, None) == {
+        "batchItemFailures": [{"itemIdentifier": "bad"}]
+    }

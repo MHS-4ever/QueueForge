@@ -21,3 +21,7 @@ output "lambda_function_name" {
 output "log_group_name" {
   value = aws_cloudwatch_log_group.processor.name
 }
+
+output "jobs_table_name" {
+  value = aws_dynamodb_table.jobs.name
+}
